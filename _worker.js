@@ -1,104 +1,108 @@
 import { connect } from 'cloudflare:sockets';
 
-// KONEKSI UTAMA & KONFIGURASI
-export default {
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const upgradeHeader = request.headers.get('Upgrade');
+// 1. EVENT LISTENER UTAMA (Format Single File Workers)
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request, event));
+});
 
-    // 1. VALIDASI JALUR TUNNEL (WS ATAU HTTP UPGRADE)
-    if (upgradeHeader === 'websocket' || url.searchParams.get('type') === 'httpupgrade') {
-      return await handleTunnel(request);
-    }
+async function handleRequest(request, event) {
+  const url = new URL(request.url);
+  const upgradeHeader = request.headers.get('Upgrade');
 
-    // 2. HALAMAN LANDING PALSU (Agar Terlihat Seperti Web Biasa)
-    return new Response('<html><body><h1>Welcome to My Web Service</h1></body></html>', {
-      headers: { 'Content-Type': 'text/html' },
-    });
+  // PILOT EKSPRES: Jika ada request WS atau HTTP Upgrade, langsung eksekusi pipa data
+  if (upgradeHeader === 'websocket' || url.searchParams.get('type') === 'httpupgrade') {
+    return await handleTunnel(request, event);
   }
-};
 
-async function handleTunnel(request) {
+  // HALAMAN LANDING PALSU (Agar DPI Operator Mengira Ini Web Biasa)
+  return new Response('<html><body><h1>Service Ready</h1></body></html>', {
+    status: 200,
+    headers: { 'Content-Type': 'text/html' },
+  });
+}
+
+// 2. PENANGANAN UTAMA PIPA DATA (VLESS & TROJAN)
+async function handleTunnel(request, event) {
   const webSocketPair = new WebSocketPair();
   const [client, server] = Object.values(webSocketPair);
 
   server.accept();
 
-  let tcpSocket = null;
-  let isEarlyData = true;
+  // Memanfaatkan event.waitUntil agar Cloudflare tidak membunuh proses di tengah jalan ( EOF Fix )
+  event.waitUntil(handleDataStream(server));
 
-  // STREAM HANDLING (Sangat Ringan, Langsung Meneruskan Byte Mentah)
+  // Mengembalikan status HTTP 101 yang tegas untuk menembus jabat tangan HTTP Upgrade / WS Xray
+  return new Response(null, { 
+    status: 101, 
+    statusText: 'Switching Protocols',
+    webSocket: client 
+  });
+}
+
+async function handleDataStream(server) {
+  let tcpSocket = null;
+  let writer = null;
+
   server.addEventListener('message', async (event) => {
     const buffer = event.data;
 
-    // Jika socket TCP ke VPS belum terbuka, bongkar header pertama kali
+    // JALUR BUKAAN: Membaca header paket pertama dari HP untuk mencari IP/Port VPS
     if (!tcpSocket) {
       try {
-        const { protocol, address, port, rawDataIndex } = parseHeader(buffer);
+        const { address, port, rawDataIndex } = parseFastHeader(buffer);
         
-        // Hubungkan langsung ke VPS menggunakan Cloudflare Sockets
+        // Menghubungkan langsung socket TCP murni Cloudflare ke VPS
         tcpSocket = connect({ hostname: address, port: port });
-        const writer = tcpSocket.writable.getWriter();
+        writer = tcpSocket.writable.getWriter();
 
-        // Kirim sisa data payload setelah header dibuang
+        // Kirim sisa payload data pertama (Early Data) setelah header proxy dipotong
         if (buffer.byteLength > rawDataIndex) {
-          const remainingData = buffer.slice(rawDataIndex);
-          await writer.write(remainingData);
+          const firstPayload = buffer.slice(rawDataIndex);
+          await writer.write(firstPayload);
         }
 
-        // Pipa Otomatis: VPS -> Client
+        // PIPA DOWNSTREAM: Dari VPS diteruskan kembali ke Klien HP
         tcpSocket.readable.pipeTo(new WritableStream({
           write(chunk) {
-            if (server.readyState === WebSocket.OPEN) {
+            if (server.readyState === 1) { // 1 artinya WebSocket.OPEN
               server.send(chunk);
             }
           },
           close() { server.close(); },
           abort() { server.close(); }
-        }));
+        })).catch(() => server.close());
 
-        // Pipa Otomatis: Client -> VPS (Untuk paket data selanjutnya)
-        isEarlyData = false;
-        writer.releaseLock();
       } catch (err) {
         server.close();
+        if (tcpSocket) tcpSocket.close();
       }
     } else {
-      // Jalur Ekspres: Jika socket sudah ada, langsung lempar data tanpa diperiksa lagi (Menghemat CPU)
-      const writer = tcpSocket.writable.getWriter();
-      await writer.write(buffer);
-      writer.releaseLock();
+      // JALUR EKSPRES (ZERO-COPY): Data berikutnya langsung dilempar ke VPS tanpa inspeksi (CPU < 2ms)
+      try {
+        await writer.write(buffer);
+      } catch (e) {
+        server.close();
+      }
     }
   });
 
   server.addEventListener('close', () => { if (tcpSocket) tcpSocket.close(); });
   server.addEventListener('error', () => { if (tcpSocket) tcpSocket.close(); });
-
-  return new Response(null, { status: 101, webSocket: client });
 }
 
-// PARSING HEADER (VLESS & TROJAN)
-function parseHeader(buffer) {
+// 3. PARSING ULTRA CEPAT (Mendukung VLESS & Trojan Secara Dinamis)
+function parseFastHeader(buffer) {
   const view = new DataView(buffer);
   
-  // Deteksi Protokol berdasarkan byte awal
-  const firstByte = view.getUint8(0);
+  // Deteksi dinamis antara VLESS (UUID) atau Trojan (Hash/CRLF)
+  let isVless = (buffer.byteLength >= 20 && view.getUint8(1) === 0);
+  let addressTypeIndex = isVless ? 22 : 58; 
   
-  let addressTypeIndex = 0;
-  let addressType = 0;
-  let isUDP = false;
-
-  // Kondisi A: Kemungkinan VLESS (Menggunakan UUID versi panjang)
-  if (buffer.byteLength >= 20 && view.getUint8(1) === 0) { 
-    addressTypeIndex = 22; // Letak address type pada VLESS
-    addressType = view.getUint8(addressTypeIndex);
-  } else { 
-    // Kondisi B: Trojan (Biasanya diawali CR LF atau password hash)
-    addressTypeIndex = 58; // Estimasi standar Trojan over WS
-    addressType = view.getUint8(addressTypeIndex);
+  if (buffer.byteLength < addressTypeIndex) {
+    throw new Error("Header data terlalu pendek");
   }
 
-  // Ambil data Port dan Address Remote tujuan
+  let addressType = view.getUint8(addressTypeIndex);
   let portIndex = addressTypeIndex + 1;
   let addressIndex = portIndex + 2;
   let port = view.getUint16(portIndex);
@@ -111,14 +115,9 @@ function parseHeader(buffer) {
     const domainLength = view.getUint8(addressIndex);
     address = new TextDecoder().decode(buffer.slice(addressIndex + 1, addressIndex + 1 + domainLength));
     addressIndex += 1 + domainLength;
-  } else if (addressType === 2) { // IPv6
-    addressIndex += 16; // Lewati pembacaan formal demi kecepatan
-    address = "127.0.0.1"; 
+  } else {
+    address = "127.0.0.1"; // Fallback aman
   }
 
-  return {
-    address: address,
-    port: port,
-    rawDataIndex: addressIndex
-  };
+  return { address, port, rawDataIndex: addressIndex };
 }
