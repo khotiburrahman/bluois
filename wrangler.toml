@@ -1,0 +1,8 @@
+name = "bluois"
+main = "_worker.js"
+compatibility_date = "2026-06-01"
+
+# Jika worker Anda membutuhkan Environment Variables (seperti PROXY_IP atau UUID), 
+# Anda bisa menambahkan di bawah ini:
+# [vars]
+# PROXY_IP = "1.2.3.4"
