@@ -1,37 +1,34 @@
 import { connect } from 'cloudflare:sockets';
 
-// 1. EVENT LISTENER UTAMA (Format Single File Workers)
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request, event));
-});
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const upgradeHeader = request.headers.get('Upgrade');
 
-async function handleRequest(request, event) {
-  const url = new URL(request.url);
-  const upgradeHeader = request.headers.get('Upgrade');
+    // 1. JALUR EKSPRES: Jika ada request WS atau HTTP Upgrade, langsung jalankan pipa data
+    if (upgradeHeader === 'websocket' || url.searchParams.get('type') === 'httpupgrade') {
+      return await handleTunnel(request, ctx);
+    }
 
-  // PILOT EKSPRES: Jika ada request WS atau HTTP Upgrade, langsung eksekusi pipa data
-  if (upgradeHeader === 'websocket' || url.searchParams.get('type') === 'httpupgrade') {
-    return await handleTunnel(request, event);
+    // 2. HALAMAN LANDING PALSU (Agar DPI Operator Mengira Ini Web Biasa)
+    return new Response('<html><body><h1>Service Ready</h1></body></html>', {
+      status: 200,
+      headers: { 'Content-Type': 'text/html' },
+    });
   }
+};
 
-  // HALAMAN LANDING PALSU (Agar DPI Operator Mengira Ini Web Biasa)
-  return new Response('<html><body><h1>Service Ready</h1></body></html>', {
-    status: 200,
-    headers: { 'Content-Type': 'text/html' },
-  });
-}
-
-// 2. PENANGANAN UTAMA PIPA DATA (VLESS & TROJAN)
-async function handleTunnel(request, event) {
+// PENANGANAN UTAMA PIPA DATA (VLESS & TROJAN)
+async function handleTunnel(request, ctx) {
   const webSocketPair = new WebSocketPair();
   const [client, server] = Object.values(webSocketPair);
 
   server.accept();
 
-  // Memanfaatkan event.waitUntil agar Cloudflare tidak membunuh proses di tengah jalan ( EOF Fix )
-  event.waitUntil(handleDataStream(server));
+  // Pengganti event.waitUntil pada format ES Modules adalah ctx.waitUntil ( EOF Fix )
+  ctx.waitUntil(handleDataStream(server));
 
-  // Mengembalikan status HTTP 101 yang tegas untuk menembus jabat tangan HTTP Upgrade / WS Xray
+  // Mengembalikan status HTTP 101 untuk menembus jabat tangan HTTP Upgrade / WS Xray
   return new Response(null, { 
     status: 101, 
     statusText: 'Switching Protocols',
@@ -46,7 +43,7 @@ async function handleDataStream(server) {
   server.addEventListener('message', async (event) => {
     const buffer = event.data;
 
-    // JALUR BUKAAN: Membaca header paket pertama dari HP untuk mencari IP/Port VPS
+    // JALUR AWAL: Membaca header paket pertama dari HP untuk mencari IP/Port VPS
     if (!tcpSocket) {
       try {
         const { address, port, rawDataIndex } = parseFastHeader(buffer);
@@ -90,7 +87,7 @@ async function handleDataStream(server) {
   server.addEventListener('error', () => { if (tcpSocket) tcpSocket.close(); });
 }
 
-// 3. PARSING ULTRA CEPAT (Mendukung VLESS & Trojan Secara Dinamis)
+// PARSING ULTRA CEPAT (Mendukung VLESS & Trojan Secara Dinamis)
 function parseFastHeader(buffer) {
   const view = new DataView(buffer);
   
