@@ -4,7 +4,7 @@ export default {
   async fetch(request, env, ctx) {
     const upgradeHeader = request.headers.get('Upgrade');
 
-    if (upgradeHeader === 'websocket') {
+    if (upgradeHeader === 'websocket' || upgradeHeader === 'httpupgrade') {
       return handleTunnel(request, ctx);
     }
 
@@ -12,19 +12,6 @@ export default {
       status: 200,
       headers: { 'Content-Type': 'text/html' },
     });
-  },
-
-  // Handler untuk Hibernatable WebSocket (wajib untuk tunnel jangka panjang)
-  async webSocketMessage(ws, message) {
-    await ws.env_handleMessage(message);
-  },
-
-  async webSocketClose(ws, code, reason) {
-    ws.env_cleanup?.();
-  },
-
-  async webSocketError(ws, error) {
-    ws.env_cleanup?.();
   }
 };
 
@@ -32,8 +19,8 @@ function handleTunnel(request, ctx) {
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
 
-  // Gunakan acceptWebSocket (Hibernatable API) bukan server.accept()
-  // Ini yang menjaga koneksi tetap hidup melewati batas CPU time normal
+  server.accept();
+
   const state = {
     tcpSocket: null,
     writer: null,
@@ -42,13 +29,8 @@ function handleTunnel(request, ctx) {
     processing: false,
   };
 
-  // Simpan state di properti WebSocket itu sendiri
-  server._state = state;
-
-  server.accept();
-
-  // Attach handler langsung ke objek
   server.addEventListener('message', async (event) => {
+    // Ambil data biner secara aman terlepas dari tipe pembungkusnya
     const buf = event.data instanceof ArrayBuffer
       ? event.data
       : event.data.buffer?.slice(event.data.byteOffset, event.data.byteOffset + event.data.byteLength)
@@ -57,15 +39,14 @@ function handleTunnel(request, ctx) {
     state.queue.push(buf);
     if (!state.processing) {
       state.processing = true;
-      await drainQueue(server, state).catch(() => cleanup(server, state));
+      await drainQueue(server, state).catch(() => cleanup(state));
       state.processing = false;
     }
   });
 
-  server.addEventListener('close', () => cleanup(server, state));
-  server.addEventListener('error', () => cleanup(server, state));
+  server.addEventListener('close', () => cleanup(state));
+  server.addEventListener('error', () => cleanup(state));
 
-  // Keepalive: kirim ping setiap 20 detik
   const timer = setInterval(() => {
     try {
       if (server.readyState === 1) {
@@ -78,15 +59,19 @@ function handleTunnel(request, ctx) {
     }
   }, 20000);
 
-  // waitUntil dengan Promise yang tidak resolve sampai WS tutup
   ctx.waitUntil(new Promise((resolve) => {
-    server.addEventListener('close', resolve);
-    server.addEventListener('error', resolve);
+    server.addEventListener('close', () => { clearInterval(timer); resolve(); });
+    server.addEventListener('error', () => { clearInterval(timer); resolve(); });
   }));
 
+  const upgradeType = request.headers.get('Upgrade');
   return new Response(null, {
     status: 101,
     statusText: 'Switching Protocols',
+    headers: {
+      'Upgrade': upgradeType,
+      'Connection': 'Upgrade'
+    },
     webSocket: client,
   });
 }
@@ -109,11 +94,14 @@ async function processMessage(server, state, buffer) {
     state.writer = state.tcpSocket.writable.getWriter();
     state.connected = true;
 
-    if (buffer.byteLength > rawDataIndex) {
-      await state.writer.write(new Uint8Array(buffer, rawDataIndex));
+    // Gunakan Subarray untuk mencegah error pembacaan data biner payload awal
+    const binaryData = new Uint8Array(buffer);
+    if (binaryData.byteLength > rawDataIndex) {
+      const payload = binaryData.subarray(rawDataIndex);
+      await state.writer.write(payload);
     }
 
-    // Pipe VPS → Client
+    // Pipe dari Alamat Tujuan (Target) -> Worker -> Client
     state.tcpSocket.readable
       .pipeTo(new WritableStream({
         write(chunk) {
@@ -129,16 +117,15 @@ async function processMessage(server, state, buffer) {
       .catch(() => safeClose(server));
 
   } else {
-    await state.writer.write(
-      buffer instanceof ArrayBuffer
-        ? new Uint8Array(buffer)
-        : new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
-    );
+    // Teruskan sisa data stream berikutnya secara utuh
+    const dataToWrite = buffer instanceof ArrayBuffer
+      ? new Uint8Array(buffer)
+      : new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    await state.writer.write(dataToWrite);
   }
 }
 
-function cleanup(server, state) {
-  safeClose(server);
+function cleanup(state) {
   try { state.writer?.releaseLock(); } catch {}
   try { state.tcpSocket?.close(); } catch {}
   state.writer = null;
@@ -152,7 +139,7 @@ function safeClose(ws) {
   } catch {}
 }
 
-// ─── PARSER HEADER ────────────────────────────────────────────────────────────
+// ─── PARSER HEADER AMAN (VLESS & TROJAN) ───────────────────────────────────────
 
 function parseFastHeader(buffer) {
   if (!(buffer instanceof ArrayBuffer)) {
@@ -164,10 +151,10 @@ function parseFastHeader(buffer) {
   const view = new DataView(buffer);
   const firstByte = view.getUint8(0);
 
-  // VLESS: byte[0] = 0 (version)
+  // VLESS Protokol
   if (firstByte === 0) {
     const addonsLen = view.getUint8(17);
-    const portIndex = 18 + addonsLen + 1; // skip addons + cmd
+    const portIndex = 18 + addonsLen + 1;
     const port = view.getUint16(portIndex);
     const addrTypeIndex = portIndex + 2;
     const addressType = view.getUint8(addrTypeIndex);
@@ -175,45 +162,50 @@ function parseFastHeader(buffer) {
     return { address, port, rawDataIndex: nextIndex };
   }
 
-  // Trojan: 56 byte hash + \r\n + cmd(1) + port(2) + atype(1)
+  // Trojan Protokol
   if (buffer.byteLength >= 62) {
     const cr = view.getUint8(56);
     const lf = view.getUint8(57);
     if (cr === 0x0d && lf === 0x0a) {
-      const port = view.getUint16(59); // skip cmd(58) → port(59)
+      const port = view.getUint16(59);
       const addrTypeIndex = 61;
       const addressType = view.getUint8(addrTypeIndex);
       const { address, nextIndex } = readAddress(view, buffer, addrTypeIndex + 1, addressType);
-      return { address, port, rawDataIndex: nextIndex };
+      
+      // SOLUSI HANDSHAKE: Buang trailing CRLF (\r\n) milik Trojan sebelum dilempar ke alamat tujuan
+      let rawDataIndex = nextIndex;
+      if (rawDataIndex + 2 <= buffer.byteLength) {
+        if (view.getUint8(rawDataIndex) === 0x0d && view.getUint8(rawDataIndex + 1) === 0x0a) {
+          rawDataIndex += 2;
+        }
+      }
+      return { address, port, rawDataIndex };
     }
   }
 
-  throw new Error('Format header tidak dikenali (bukan VLESS atau Trojan)');
+  throw new Error('Format header tidak valid');
 }
 
 function readAddress(view, buffer, startIndex, addressType) {
-  if (addressType === 1) {
-    // IPv4
-    if (buffer.byteLength < startIndex + 4) throw new Error('IPv4 truncated');
+  if (addressType === 1) { // IPv4
+    if (buffer.byteLength < startIndex + 4) throw new Error('IPv4 terpotong');
     const address = Array.from(new Uint8Array(buffer, startIndex, 4)).join('.');
     return { address, nextIndex: startIndex + 4 };
   }
 
-  if (addressType === 3) {
-    // Domain
+  if (addressType === 3) { // Domain Name
     const len = view.getUint8(startIndex);
-    if (buffer.byteLength < startIndex + 1 + len) throw new Error('Domain truncated');
+    if (buffer.byteLength < startIndex + 1 + len) throw new Error('Domain terpotong');
     const address = new TextDecoder().decode(new Uint8Array(buffer, startIndex + 1, len));
     return { address, nextIndex: startIndex + 1 + len };
   }
 
-  if (addressType === 2) {
-    // IPv6
-    if (buffer.byteLength < startIndex + 16) throw new Error('IPv6 truncated');
+  if (addressType === 2) { // IPv6
+    if (buffer.byteLength < startIndex + 16) throw new Error('IPv6 terpotong');
     const parts = [];
     for (let i = 0; i < 8; i++) parts.push(view.getUint16(startIndex + i * 2).toString(16));
     return { address: parts.join(':'), nextIndex: startIndex + 16 };
   }
 
-  throw new Error(`Tipe address tidak dikenal: ${addressType}`);
+  throw new Error(`Tipe alamat tidak dikenal: ${addressType}`);
 }
