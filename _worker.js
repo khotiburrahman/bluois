@@ -30,17 +30,20 @@ function handleTunnel(request, ctx) {
   };
 
   server.addEventListener('message', async (event) => {
-    // Ambil data biner secara aman terlepas dari tipe pembungkusnya
-    const buf = event.data instanceof ArrayBuffer
-      ? event.data
-      : event.data.buffer?.slice(event.data.byteOffset, event.data.byteOffset + event.data.byteLength)
-        ?? event.data;
+    try {
+      const buf = event.data instanceof ArrayBuffer
+        ? event.data
+        : event.data.buffer?.slice(event.data.byteOffset, event.data.byteOffset + event.data.byteLength)
+          ?? event.data;
 
-    state.queue.push(buf);
-    if (!state.processing) {
-      state.processing = true;
-      await drainQueue(server, state).catch(() => cleanup(state));
-      state.processing = false;
+      state.queue.push(buf);
+      if (!state.processing) {
+        state.processing = true;
+        await drainQueue(server, state).catch(() => cleanup(state));
+        state.processing = false;
+      }
+    } catch {
+      cleanup(state);
     }
   });
 
@@ -64,14 +67,10 @@ function handleTunnel(request, ctx) {
     server.addEventListener('error', () => { clearInterval(timer); resolve(); });
   }));
 
-  const upgradeType = request.headers.get('Upgrade');
+  // SOLUSI UTAMA: Hapus objek headers manual. 
+  // Biarkan Cloudflare mengonstruksi handshake 101 secara otomatis via properti webSocket.
   return new Response(null, {
     status: 101,
-    statusText: 'Switching Protocols',
-    headers: {
-      'Upgrade': upgradeType,
-      'Connection': 'Upgrade'
-    },
     webSocket: client,
   });
 }
@@ -94,14 +93,12 @@ async function processMessage(server, state, buffer) {
     state.writer = state.tcpSocket.writable.getWriter();
     state.connected = true;
 
-    // Gunakan Subarray untuk mencegah error pembacaan data biner payload awal
     const binaryData = new Uint8Array(buffer);
     if (binaryData.byteLength > rawDataIndex) {
       const payload = binaryData.subarray(rawDataIndex);
       await state.writer.write(payload);
     }
 
-    // Pipe dari Alamat Tujuan (Target) -> Worker -> Client
     state.tcpSocket.readable
       .pipeTo(new WritableStream({
         write(chunk) {
@@ -117,7 +114,6 @@ async function processMessage(server, state, buffer) {
       .catch(() => safeClose(server));
 
   } else {
-    // Teruskan sisa data stream berikutnya secara utuh
     const dataToWrite = buffer instanceof ArrayBuffer
       ? new Uint8Array(buffer)
       : new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
@@ -139,19 +135,19 @@ function safeClose(ws) {
   } catch {}
 }
 
-// ─── PARSER HEADER AMAN (VLESS & TROJAN) ───────────────────────────────────────
+// ─── PARSER HEADER ────────────────────────────────────────────────────────────
 
 function parseFastHeader(buffer) {
   if (!(buffer instanceof ArrayBuffer)) {
     buffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
   }
 
-  if (buffer.byteLength < 20) throw new Error('Header terlalu pendek');
+  if (buffer.byteLength < 20) throw new Error('Header pendek');
 
   const view = new DataView(buffer);
   const firstByte = view.getUint8(0);
 
-  // VLESS Protokol
+  // VLESS
   if (firstByte === 0) {
     const addonsLen = view.getUint8(17);
     const portIndex = 18 + addonsLen + 1;
@@ -162,7 +158,7 @@ function parseFastHeader(buffer) {
     return { address, port, rawDataIndex: nextIndex };
   }
 
-  // Trojan Protokol
+  // Trojan
   if (buffer.byteLength >= 62) {
     const cr = view.getUint8(56);
     const lf = view.getUint8(57);
@@ -172,7 +168,6 @@ function parseFastHeader(buffer) {
       const addressType = view.getUint8(addrTypeIndex);
       const { address, nextIndex } = readAddress(view, buffer, addrTypeIndex + 1, addressType);
       
-      // SOLUSI HANDSHAKE: Buang trailing CRLF (\r\n) milik Trojan sebelum dilempar ke alamat tujuan
       let rawDataIndex = nextIndex;
       if (rawDataIndex + 2 <= buffer.byteLength) {
         if (view.getUint8(rawDataIndex) === 0x0d && view.getUint8(rawDataIndex + 1) === 0x0a) {
@@ -183,29 +178,29 @@ function parseFastHeader(buffer) {
     }
   }
 
-  throw new Error('Format header tidak valid');
+  throw new Error('Format salah');
 }
 
 function readAddress(view, buffer, startIndex, addressType) {
   if (addressType === 1) { // IPv4
-    if (buffer.byteLength < startIndex + 4) throw new Error('IPv4 terpotong');
+    if (buffer.byteLength < startIndex + 4) throw new Error('IPv4 truncated');
     const address = Array.from(new Uint8Array(buffer, startIndex, 4)).join('.');
     return { address, nextIndex: startIndex + 4 };
   }
 
-  if (addressType === 3) { // Domain Name
+  if (addressType === 3) { // Domain
     const len = view.getUint8(startIndex);
-    if (buffer.byteLength < startIndex + 1 + len) throw new Error('Domain terpotong');
+    if (buffer.byteLength < startIndex + 1 + len) throw new Error('Domain truncated');
     const address = new TextDecoder().decode(new Uint8Array(buffer, startIndex + 1, len));
     return { address, nextIndex: startIndex + 1 + len };
   }
 
   if (addressType === 2) { // IPv6
-    if (buffer.byteLength < startIndex + 16) throw new Error('IPv6 terpotong');
+    if (buffer.byteLength < startIndex + 16) throw new Error('IPv6 truncated');
     const parts = [];
     for (let i = 0; i < 8; i++) parts.push(view.getUint16(startIndex + i * 2).toString(16));
     return { address: parts.join(':'), nextIndex: startIndex + 16 };
   }
 
-  throw new Error(`Tipe alamat tidak dikenal: ${addressType}`);
+  throw new Error('Atype unknown');
 }
