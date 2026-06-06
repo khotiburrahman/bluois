@@ -2,7 +2,17 @@ name = "haribelajar"
 main = "_worker.js"
 compatibility_date = "2026-06-01"
 
-# Jika worker Anda membutuhkan Environment Variables (seperti PROXY_IP atau UUID), 
-# Anda bisa menambahkan di bawah ini:
-# [vars]
-# PROXY_IP = "1.2.3.4"
+# Binding ke KV Namespace
+kv_namespaces = [
+  { binding = "PROXY_DB", id = "b5b2d4e9ddf44d5382cba7fbac540536" }
+]
+
+# Konfigurasi Cron Job untuk auto-sync setiap jam
+[triggers]
+crons = ["0 * * * *"] # Jalankan setiap jam tepat (menit 0)
+
+[unsafe.metadata.observability]
+enabled = true
+
+[observability.logs]
+enabled = true
